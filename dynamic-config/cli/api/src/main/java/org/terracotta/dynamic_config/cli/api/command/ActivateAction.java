@@ -151,13 +151,7 @@ public class ActivateAction extends RemoteAction {
 
     new ClusterValidator(cluster).validate(ClusterState.ACTIVATED);
 
-    List<String> replicaNodes = cluster.getNodes().stream()
-      .filter(node -> DisasterRecoveryMode.fromNode(node) == DisasterRecoveryMode.REPLICA)
-      .map(Node::getName).sorted().toList();
-    if (!replicaNodes.isEmpty()) {
-      throw new IllegalStateException("Nodes with names: " + replicaNodes + " have replica-mode enabled. " +
-        "A cluster cannot be activated if replica-mode is enabled on any node.");
-    }
+    ensureNoReplicaModeForActivation();
 
     // getting the list of nodes where to push the same topology
 
@@ -191,6 +185,16 @@ public class ActivateAction extends RemoteAction {
       output.info("Cluster topology loaded from: " + hostPort + ": " + cluster.toShapeString());
       return cluster;
     }).findFirst();
+  }
+
+  private void ensureNoReplicaModeForActivation() {
+    List<String> replicaNodes = cluster.getNodes().stream()
+      .filter(node -> DisasterRecoveryMode.fromNode(node) == DisasterRecoveryMode.REPLICA)
+      .map(Node::getName).sorted().toList();
+    if (!replicaNodes.isEmpty()) {
+      throw new IllegalStateException("Nodes with names: " + replicaNodes + " have replica-mode enabled. " +
+        "A cluster cannot be activated if replica-mode is enabled on any node.");
+    }
   }
 
   Cluster getCluster() {
