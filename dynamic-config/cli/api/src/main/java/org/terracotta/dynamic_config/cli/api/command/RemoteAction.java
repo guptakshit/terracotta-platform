@@ -726,7 +726,7 @@ public abstract class RemoteAction implements Runnable {
     // expected passives without relay nodes (relay nodes are not contacted to apply configuration changes at runtime)
     Collection<String> expectedPassives = cluster.getNodes()
         .stream()
-        .filter(node -> !DisasterRecoveryMode.isRelay(node))
+        .filter(node -> !DisasterRecoveryMode.isRelay(node, cluster))
         .map(Node::getName)
         .collect(Collectors.toCollection(TreeSet::new));
     expectedPassives.removeAll(actives);
@@ -783,11 +783,6 @@ public abstract class RemoteAction implements Runnable {
   protected final boolean isActivated(HostPort expectedOnlineNode) {
     LOGGER.trace("isActivated({})", expectedOnlineNode);
     return withTopologyService(expectedOnlineNode, TopologyService::isActivated);
-  }
-
-  protected final boolean isReplica(HostPort expectedOnlineNode) {
-    LOGGER.trace("isReplica({})", expectedOnlineNode);
-    return withTopologyService(expectedOnlineNode, TopologyService::isReplica);
   }
 
   protected final Endpoint findAnyOnlineNode(Collection<HostPort> nodes) {

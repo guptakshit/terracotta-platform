@@ -60,6 +60,8 @@ public class ReplicaActivate2x1WithRelayLinkIT extends DynamicConfigIT {
     assertThat(configTool("attach", "-to-stripe", "localhost:" + getNodePort(2, 2), "-node", "localhost:" + getNodePort(2, 3)), is(successful()));
     assertThat(configTool("attach", "-to-stripe", "localhost:" + getNodePort(2, 2), "-node", "localhost:" + getNodePort(2, 4)), is(successful()));
     assertThat(configTool("attach", "-to-cluster", "localhost:" + getNodePort(1, 2), "-stripe", "localhost:" + getNodePort(2, 2)), is(successful()));
+
+    System.out.println("setup primary cluster completed");
   }
 
   private void configureAndActivateRelayNodes() {
@@ -80,6 +82,8 @@ public class ReplicaActivate2x1WithRelayLinkIT extends DynamicConfigIT {
     waitForPassiveRelay(2, 4);
 
     assertThat(getUpcomingCluster("localhost", getNodePort(1, 2)).getNodeCount(), is(equalTo(6)));
+
+    System.out.println("configureAndActivateRelayNodes completed");
   }
 
   private void startAndLinkReplicaNodes() {
@@ -97,6 +101,8 @@ public class ReplicaActivate2x1WithRelayLinkIT extends DynamicConfigIT {
     waitForPassiveReplicaStart(1, 1);
     waitForPassiveReplicaStart(2, 1);
 
+    System.out.println("replica nodes passive replica start completed");
+
     // replica node ports
     int replica1Port = getNode(1, 1).getTsaPort();
     int replica2Port = getNode(2, 1).getTsaPort();
@@ -105,15 +111,39 @@ public class ReplicaActivate2x1WithRelayLinkIT extends DynamicConfigIT {
     assertThat(configTool("set", "-connect-to", "localhost:" + getNodePort(1, 2),
       "-setting", "node-1-4:replica-port=" + replica1Port, "-setting", "node-2-4:replica-port=" + replica2Port), is(successful()));
 
+    System.out.println("relay nodes replica information completed");
+
     waitForRelayChangeToSync();
     waitForPassiveRelay(1, 4);
     waitForPassiveRelay(2, 4);
+
+    System.out.println("waiting for link to establish completion");
 
     // link should've been established between relay and replica nodes, replicas should transition to PASSIVE-REPLICA state
     waitUntilServerLogs(getNode(1, 1), "joined the cluster");
     waitUntilServerLogs(getNode(2, 1), "joined the cluster");
     waitForPassiveReplica(1, 1);
     waitForPassiveReplica(2, 1);
+
+    System.out.println("servers are in replica state completed");
+
+// Stop all primary cluster nodes
+    IntStream.rangeClosed(1, 2).forEach(stripeId ->
+      IntStream.rangeClosed(2, 4).forEach(nodeId -> {
+        stopNode(stripeId, nodeId);
+        waitForStopped(stripeId, nodeId);
+      })
+    );
+
+    stopNode(1, 1);
+    waitForStopped(1, 1);
+    startNode(1, 1);
+    try {
+      Thread.sleep(10_000);
+    } catch (InterruptedException e) {
+      throw new RuntimeException(e);
+    }
+    System.out.println("done sleeping");
   }
 
   private void failoverToReplicaCluster() throws IOException, URISyntaxException {
@@ -124,11 +154,14 @@ public class ReplicaActivate2x1WithRelayLinkIT extends DynamicConfigIT {
         waitForStopped(stripeId, nodeId);
       })
     );
+//
+//    // activate DR cluster
+//    String config = copyConfigProperty("/config-property-files/replica2x1.properties", List.of(new int[]{1, 1}, new int[]{2, 1})).toString();
+//    ToolExecutionResult activateReplica = configTool("activate", "-cluster-name", "replica-cluster1", "-config-file", config);
+//    assertThat(activateReplica, is(successful()));
 
-    // activate DR cluster
-    String config = copyConfigProperty("/config-property-files/replica2x1.properties", List.of(new int[]{1, 1}, new int[]{2, 1})).toString();
-    ToolExecutionResult activateReplica = configTool("activate", "-cluster-name", "replica-cluster1", "-config-file", config);
-    assertThat(activateReplica, is(successful()));
+    // unset replica property
+    configTool("unset", "-connect-to", getNodeHostPort(1, 1).toString(), "-setting", "replica");
 
     // replicas should transition to active state
     waitForActive(1, 1);

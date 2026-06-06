@@ -55,7 +55,6 @@ class ServerStateCheck implements NomadPermissionChangeProcessor.Check {
       // we can allow any change to happen if the server is in one of these states:
       SYNCHRONIZING,
       RELAY,
-      // we allow activation to happen if the server is in one of the these states:
       REPLICA_SUSPENDED,
       REPLICA
   );

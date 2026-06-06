@@ -163,11 +163,17 @@ import static org.terracotta.dynamic_config.api.model.Version.V2;
  *
  *  replica-hostname, replica-port
  *      Permission: when: [activated, configuring] allow: [get] at levels: [cluster, stripe, node]
- *      Permission: when: [activated, configuring] allow: [set] at levels: [node]
+ *      Permission: when: [activated, configuring] allow: [set, unset] at levels: [node]
  *      Permission: when: [configuring] allow: [import] at levels: [node]
  *
- *  replica, relay-hostname, relay-port, relay-group-port
+ *  replica
+ *      Permission: when: [activated, configuring] allow: [get] at levels: [cluster]
+ *      Permission: when: [configuring] allow: [set, import] at levels: [cluster]
+ *      Permission: when: [activated, configuring] allow: [unset] at levels: [cluster]
+ *
+ *  relay-hostname, relay-port, relay-group-port
  *      Permission: when: [activated, configuring] allow: [get] at levels: [cluster, stripe, node]
+ *      Permission: when: [activated, configuring] allow: [set, unset] at levels: [node]
  *      Permission: when: [configuring] allow: [import] at levels: [node]
  *
  * </pre>
@@ -388,7 +394,7 @@ public enum Setting {
     intoNode(Node::setReplicaHostname),
     asList(
       when(CONFIGURING, ACTIVATED).allow(GET).atAnyLevels(),
-      when(CONFIGURING, ACTIVATED).allow(SET).atLevel(NODE),
+      when(CONFIGURING, ACTIVATED).allow(SET, UNSET).atLevel(NODE),  // Allow unset to remove properties after removing relay
       when(CONFIGURING).allow(IMPORT).atLevel(NODE)
     ),
     of(NODE_RESTART),
@@ -405,7 +411,7 @@ public enum Setting {
     intoNode((node, value) -> node.setReplicaPort(value == null ? null : Integer.parseInt(value))),
     asList(
       when(CONFIGURING, ACTIVATED).allow(GET).atAnyLevels(),
-      when(CONFIGURING, ACTIVATED).allow(SET).atLevel(NODE),
+      when(CONFIGURING, ACTIVATED).allow(SET, UNSET).atLevel(NODE),
       when(CONFIGURING).allow(IMPORT).atLevel(NODE)
     ),
     of(NODE_RESTART),
@@ -417,12 +423,13 @@ public enum Setting {
     of(V1, V2),
     false,
     always(false),
-    NODE,
-    fromNode(Node::getReplica),
-    intoNode((node, value) -> node.setReplica(value == null ? null : Boolean.valueOf(value))),
+    CLUSTER,
+    fromCluster(Cluster::getReplica),
+    intoCluster((cluster, value) -> cluster.setReplica(value == null ? null : Boolean.valueOf(value))),
     asList(
-      when(CONFIGURING, ACTIVATED).allow(GET).atAnyLevels(),
-      when(CONFIGURING).allow(IMPORT).atLevel(NODE)
+      when(CONFIGURING, ACTIVATED).allow(GET).atLevel(CLUSTER),
+      when(CONFIGURING).allow(SET, IMPORT).atLevel(CLUSTER),
+      when(CONFIGURING, ACTIVATED).allow(UNSET).atLevel(CLUSTER)  // Activated clusters can only unset, not set to become replica
     ),
     of(PRESENCE),
     asList("true", "false")
@@ -436,9 +443,10 @@ public enum Setting {
     intoNode(Node::setRelayHostname),
     asList(
       when(CONFIGURING, ACTIVATED).allow(GET).atAnyLevels(),
-      when(CONFIGURING).allow(IMPORT).atLevel(NODE)
+      when(CONFIGURING).allow(IMPORT).atLevel(NODE),
+      when(CONFIGURING, ACTIVATED).allow(SET, UNSET).atLevel(NODE)  // Allow changing relay hostname in activated state (requires restart)
     ),
-    EnumSet.noneOf(Requirement.class),
+    of(NODE_RESTART),
     emptyList(),
     emptyList(),
     (key, value) -> HOST_VALIDATOR.accept(SettingName.RELAY_HOSTNAME, tuple2(key, value))
@@ -452,9 +460,10 @@ public enum Setting {
     intoNode((node, value) -> node.setRelayPort(value == null ? null : Integer.parseInt(value))),
     asList(
       when(CONFIGURING, ACTIVATED).allow(GET).atAnyLevels(),
-      when(CONFIGURING).allow(IMPORT).atLevel(NODE)
+      when(CONFIGURING).allow(IMPORT).atLevel(NODE),
+      when(CONFIGURING, ACTIVATED).allow(SET, UNSET).atLevel(NODE)
     ),
-    EnumSet.noneOf(Requirement.class),
+    of(NODE_RESTART),
     emptyList(),
     emptyList(),
     (key, value) -> PORT_VALIDATOR.accept(SettingName.RELAY_PORT, tuple2(key, value))
@@ -468,9 +477,10 @@ public enum Setting {
     intoNode((node, value) -> node.setRelayGroupPort(value == null ? null : Integer.parseInt(value))),
     asList(
       when(CONFIGURING, ACTIVATED).allow(GET).atAnyLevels(),
-      when(CONFIGURING).allow(IMPORT).atLevel(NODE)
+      when(CONFIGURING).allow(IMPORT).atLevel(NODE),
+      when(CONFIGURING, ACTIVATED).allow(SET, UNSET).atLevel(NODE)
     ),
-    EnumSet.noneOf(Requirement.class),
+    of(NODE_RESTART),
     emptyList(),
     emptyList(),
     (key, value) -> PORT_VALIDATOR.accept(SettingName.RELAY_GROUP_PORT, tuple2(key, value))

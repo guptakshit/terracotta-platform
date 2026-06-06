@@ -141,7 +141,7 @@ public abstract class ConfigurationMutationAction extends ConfigurationAction {
 
     boolean allOnlineNodesActivated = areAllNodesActivated(onlineNodes.keySet());
 
-    new ClusterValidator(updatedCluster).validate(allOnlineNodesActivated ? ACTIVATED : CONFIGURING, operation);
+    new ClusterValidator(updatedCluster).validate(allOnlineNodesActivated ? ACTIVATED : CONFIGURING);
 
     if (allOnlineNodesActivated) {
       licenseValidation(node, updatedCluster);
@@ -156,8 +156,13 @@ public abstract class ConfigurationMutationAction extends ConfigurationAction {
     }
 
     LOGGER.debug("New configuration change(s) can be sent");
+    if (DisasterRecoveryMode.REPLICA.isEnabled(null, originalCluster)) {
+      System.out.println("sending change through diagnostics");
+      MultiSettingNomadChange changes = getNomadChanges(updatedCluster);
+      runConfigurationChange(updatedCluster, onlineNodes, changes);
+    }
 
-    if (allOnlineNodesActivated) {
+    else if (allOnlineNodesActivated) {
       // Filter out relay nodes from onlineNodes, they are not contacted to apply configuration changes at runtime
       // onlineRelayNodes will contain the list of relay nodes we will automatically restart
       // to sync configuration changes during passive sync
@@ -183,7 +188,7 @@ public abstract class ConfigurationMutationAction extends ConfigurationAction {
       // display unreachable nodes
       final Set<String> unreachableRelayNodes = originalCluster.getNodes()
         .stream()
-        .filter(DisasterRecoveryMode::isRelay)
+        .filter(node -> DisasterRecoveryMode.isRelay(node, originalCluster))
         .filter(node -> node.getEndpoints().stream().noneMatch(onlineRelayNodes::contains))
         .map(Node::getName)
         .collect(Collectors.toSet());

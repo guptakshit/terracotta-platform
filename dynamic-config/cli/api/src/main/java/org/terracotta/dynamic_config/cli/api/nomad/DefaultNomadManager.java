@@ -72,6 +72,8 @@ import static org.terracotta.diagnostic.model.LogicalServerState.ACTIVE;
 import static org.terracotta.diagnostic.model.LogicalServerState.ACTIVE_RECONNECTING;
 import static org.terracotta.diagnostic.model.LogicalServerState.DIAGNOSTIC;
 import static org.terracotta.diagnostic.model.LogicalServerState.PASSIVE;
+import static org.terracotta.diagnostic.model.LogicalServerState.REPLICA;
+import static org.terracotta.diagnostic.model.LogicalServerState.REPLICA_SUSPENDED;
 
 public class DefaultNomadManager<T> implements NomadManager<T> {
   private static final Logger LOGGER = LoggerFactory.getLogger(NomadManager.class);
@@ -80,7 +82,9 @@ public class DefaultNomadManager<T> implements NomadManager<T> {
       ACTIVE,
       PASSIVE,
       ACTIVE_RECONNECTING,
-      DIAGNOSTIC // this mode is when a server is forced to start in diagnostic mode for repair
+      DIAGNOSTIC,
+      REPLICA_SUSPENDED,
+      REPLICA // this mode is when a server is forced to start in diagnostic mode for repair
   );
 
   private final NomadEnvironment environment;
@@ -111,10 +115,15 @@ public class DefaultNomadManager<T> implements NomadManager<T> {
   public void runConfigurationChange(Cluster destinationCluster, Map<Endpoint, LogicalServerState> onlineNodes,
                                      DynamicConfigNomadChange changes, ChangeResultReceiver<T> results) {
     LOGGER.debug("Attempting to make co-ordinated configuration change: {} on nodes: {}", changes, onlineNodes);
+    System.out.println("using diagnostic client");
     checkServerStates(onlineNodes);
-    try (NomadClient<T> client = createBiChannelNomadClient(destinationCluster, onlineNodes)) {
+    List<Endpoint> orderedList = keepOnlineAndOrderPassivesFirst(onlineNodes);
+    try (NomadClient<T> client = createDiagnosticNomadClient(orderedList)) {
       client.tryApplyChange(new MultiChangeResultReceiver<>(asList(new LoggingResultReceiver<>(), results)), changes);
     }
+    //    try (NomadClient<T> client = createBiChannelNomadClient(destinationCluster, onlineNodes)) {
+//      client.tryApplyChange(new MultiChangeResultReceiver<>(asList(new LoggingResultReceiver<>(), results)), changes);
+//    }
   }
 
   public void runConfigurationRepair(Map<Endpoint, LogicalServerState> onlineActivatedNodes, int totalNodeCount, RecoveryResultReceiver<T> results, ChangeRequestState forcedState) {
