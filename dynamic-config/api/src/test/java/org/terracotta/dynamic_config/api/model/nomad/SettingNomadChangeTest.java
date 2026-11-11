@@ -36,6 +36,7 @@ import static org.terracotta.dynamic_config.api.model.Setting.CLUSTER_NAME;
 import static org.terracotta.dynamic_config.api.model.Setting.NODE_BACKUP_DIR;
 import static org.terracotta.dynamic_config.api.model.Setting.NODE_LOG_DIR;
 import static org.terracotta.dynamic_config.api.model.Setting.OFFHEAP_RESOURCES;
+import static org.terracotta.dynamic_config.api.model.Setting.REPLICA;
 import static org.terracotta.dynamic_config.api.model.Testing.N_UIDS;
 import static org.terracotta.dynamic_config.api.model.Testing.S_UIDS;
 import static org.terracotta.dynamic_config.api.model.Testing.newTestCluster;
@@ -154,6 +155,43 @@ public class SettingNomadChangeTest {
     // unset command executed (after commit only) on cluster2 / node2 to update backup dir of cluster2 / node1
     // => we should update the runtime topology after commit (but change won't be applied since not on the right node)
     assertTrue(unset(node(N_UIDS[1]), NODE_BACKUP_DIR).canUpdateRuntimeTopology(new NodeContext(cluster2, N_UIDS[2])));
+  }
+
+  @Test
+  public void test_set_unset_replica() {
+    // stripe-1: node1 (to become replica), node2 / stripe-2: node3
+    Cluster cluster1 = newTestCluster("cluster1",
+        newTestStripe("stripe-1", S_UIDS[1])
+            .addNode(newTestNode("node1", "localhost", 9410, N_UIDS[1]))
+            .addNode(newTestNode("node2", "localhost", 9411, N_UIDS[2])),
+        newTestStripe("stripe-2", S_UIDS[2])
+            .addNode(newTestNode("node3", "localhost", 9412, N_UIDS[3])));
+
+    // same cluster where node1 is a replica
+    Cluster cluster2 = cluster1.clone();
+    cluster2.getNode(N_UIDS[1]).get().setReplica(true);
+
+    // set replica on node1: node1 must restart to start as replica
+    assertFalse(set(node(N_UIDS[1]), REPLICA, "true").canUpdateRuntimeTopology(new NodeContext(cluster1, N_UIDS[1])));
+    // set replica on node1: node2 (same stripe) must restart to start in diagnostic mode
+    assertFalse(set(node(N_UIDS[1]), REPLICA, "true").canUpdateRuntimeTopology(new NodeContext(cluster1, N_UIDS[2])));
+    // set replica on node1: node3 (other stripe) is not impacted
+    assertTrue(set(node(N_UIDS[1]), REPLICA, "true").canUpdateRuntimeTopology(new NodeContext(cluster1, N_UIDS[3])));
+
+    // unset replica on node1 (failover): applied at runtime on node1 (the config change handler fails over the replica to active)
+    assertTrue(unset(node(N_UIDS[1]), REPLICA).canUpdateRuntimeTopology(new NodeContext(cluster2, N_UIDS[1])));
+    assertTrue(set(node(N_UIDS[1]), REPLICA, "false").canUpdateRuntimeTopology(new NodeContext(cluster2, N_UIDS[1])));
+    // unset replica on node1: node2 (same stripe) must restart to leave diagnostic mode and join node1 as passive
+    assertFalse(unset(node(N_UIDS[1]), REPLICA).canUpdateRuntimeTopology(new NodeContext(cluster2, N_UIDS[2])));
+    assertFalse(set(node(N_UIDS[1]), REPLICA, "false").canUpdateRuntimeTopology(new NodeContext(cluster2, N_UIDS[2])));
+    // unset replica on node1: node3 (other stripe) is not impacted
+    assertTrue(unset(node(N_UIDS[1]), REPLICA).canUpdateRuntimeTopology(new NodeContext(cluster2, N_UIDS[3])));
+
+    // changes that do not change the replica flag do not require any restart
+    assertTrue(set(node(N_UIDS[1]), REPLICA, "true").canUpdateRuntimeTopology(new NodeContext(cluster2, N_UIDS[1])));
+    assertTrue(set(node(N_UIDS[1]), REPLICA, "true").canUpdateRuntimeTopology(new NodeContext(cluster2, N_UIDS[2])));
+    assertTrue(unset(node(N_UIDS[2]), REPLICA).canUpdateRuntimeTopology(new NodeContext(cluster2, N_UIDS[1])));
+    assertTrue(unset(node(N_UIDS[2]), REPLICA).canUpdateRuntimeTopology(new NodeContext(cluster2, N_UIDS[2])));
   }
 
   @Test

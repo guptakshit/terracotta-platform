@@ -31,7 +31,6 @@ import org.terracotta.dynamic_config.api.service.IParameterSubstitutor;
 import org.terracotta.dynamic_config.api.service.TopologyService;
 import org.terracotta.dynamic_config.test_support.handler.GroupPortSimulateHandler;
 import org.terracotta.dynamic_config.test_support.handler.LoggerOverrideConfigChangeHandler;
-import org.terracotta.dynamic_config.test_support.handler.ReplicaChangeHandler;
 import org.terracotta.dynamic_config.test_support.handler.ReplicaSimulationHandler;
 import org.terracotta.dynamic_config.test_support.handler.SimulationHandler;
 import org.terracotta.dynamic_config.test_support.processor.MyDummyNomadAdditionChangeProcessor;
@@ -100,7 +99,9 @@ public class TestServiceProvider implements ServiceProvider {
     // 1. We cannot access the classpath of the service containing ReplicaChangeHandler
     // 2. There is no ordering guarantee when service providers are loaded, so TestServiceProvider can be loaded before or after the DC service provide registering the real ReplicaChangeHandler.
     //    So this is a best effort to use the wired one, otherwise we provide teh copy.
-    ConfigChangeHandler replicaHandler = manager.findConfigChangeHandler(REPLICA).orElseGet(() -> new ReplicaChangeHandler(server));
+    // TODO [REPLICA-EXTRA-NODES - to be owned by another developer]: the test copy of ReplicaChangeHandler was removed
+    //  with the real one: the replica handler is now an accept-all handler (failover is done by replica-failover).
+    ConfigChangeHandler replicaHandler = manager.findConfigChangeHandler(REPLICA).orElseGet(ConfigChangeHandler::accept);
     SelectingConfigChangeHandler<String> selectingHandler = new SelectingConfigChangeHandler<String>()
       .add(SIMULATE_ACTION_TC_PROP, new ReplicaSimulationHandler(server, topologyService))
       .fallback(replicaHandler)

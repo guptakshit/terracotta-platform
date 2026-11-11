@@ -96,6 +96,7 @@ import static java.util.stream.Stream.concat;
 import static org.terracotta.diagnostic.model.LogicalServerState.ACTIVE;
 import static org.terracotta.diagnostic.model.LogicalServerState.ACTIVE_RECONNECTING;
 import static org.terracotta.diagnostic.model.LogicalServerState.ACTIVE_SUSPENDED;
+import static org.terracotta.diagnostic.model.LogicalServerState.DIAGNOSTIC;
 import static org.terracotta.diagnostic.model.LogicalServerState.PASSIVE;
 import static org.terracotta.diagnostic.model.LogicalServerState.RELAY;
 import static org.terracotta.diagnostic.model.LogicalServerState.REPLICA;
@@ -175,8 +176,13 @@ public abstract class RemoteAction implements Runnable {
         // these are the list of states that we allow to consider a server has restarted
         // In dynamic config, restarted means that a node has reach a state that is after the STARTING state
         // and has consequently bootstrapped the configuration from Nomad.
+        // TODO [REPLICA-EXTRA-NODES - to be owned by another developer]: DIAGNOSTIC added because the nodes of a
+        //  stripe having a replica node (other than the replica node) start in diagnostic mode.
+        //  Tests to add:
+        //  - unit: activation of a cluster having 1 replica + 1 other node per stripe waits for REPLICA_SUSPENDED/REPLICA and DIAGNOSTIC
+        //  - IT: activate a 1x2 cluster with 1 replica node => command succeeds, node-1-1 is PASSIVE-REPLICA-START, node-1-2 is DIAGNOSTIC
         EnumSet.of(ACTIVE, ACTIVE_RECONNECTING, ACTIVE_SUSPENDED, PASSIVE, PASSIVE_SUSPENDED, SYNCHRONIZING,
-          RELAY, REPLICA_SUSPENDED, REPLICA));
+          RELAY, REPLICA_SUSPENDED, REPLICA, DIAGNOSTIC));
     output.info("All nodes came back up");
   }
 
@@ -223,8 +229,52 @@ public abstract class RemoteAction implements Runnable {
     }
   }
 
-  protected final boolean isReplicaCluster(Map<Endpoint, LogicalServerState> onlineNodes) {
-    return !onlineNodes.isEmpty() && onlineNodes.values().stream().allMatch(s -> s == REPLICA || s == REPLICA_SUSPENDED);
+  // TODO [REPLICA-EXTRA-NODES - to be owned by another developer]: a replica cluster is now detected from the replica
+  //  flag of the configuration instead of the runtime states of the nodes, because the states are not enough anymore:
+  //  - a replica cluster can now have other nodes (in DIAGNOSTIC state) alongside the replica node in each stripe
+  //  - during replica-failover, the replica nodes are failed over to ACTIVE first (JMX call), and the replica flag
+  //    is only unset afterwards, while the other nodes are still in DIAGNOSTIC state
+  //  The cluster passed must be the current configuration (not a configuration being changed).
+  //  Tests to add:
+  //  - unit: isReplicaCluster is true when at least one node has replica=true, false otherwise
+  //  - unit: ensureClusterIsReadyForChange succeeds for a 1x2 replica cluster with states {REPLICA, DIAGNOSTIC},
+  //    {REPLICA_SUSPENDED, DIAGNOSTIC} and {ACTIVE, DIAGNOSTIC} (failed over, replica flag not unset yet)
+  //  - unit: ensureClusterIsReadyForChange fails for a 1x2 replica cluster with states {REPLICA, PASSIVE},
+  //    {ACTIVE, PASSIVE} (nodes not restarted after converting) and {DIAGNOSTIC} (replica node offline)
+  //  - IT: 1x2 replica cluster (1 replica + 1 diagnostic node): set/unset of another setting (i.e. logger-overrides) succeeds through diagnostic
+  //  - IT: 1x3 replica cluster with one offline node: detach the offline node succeeds
+  //    (recovery path when a relay node was offline and stranded after converting the cluster with -force)
+  protected static boolean isReplicaCluster(Cluster cluster) {
+    return cluster.getNodes().stream().anyMatch(DisasterRecoveryMode::isReplica);
+  }
+
+  /**
+   * Waits for a node to be ACTIVE, at most restartWaitTime
+   *
+   * @return true if the node is ACTIVE
+   */
+  protected final boolean waitForActive(Endpoint endpoint) {
+    output.info("Waiting for node: {} to become ACTIVE...", endpoint);
+    final long deadline = System.nanoTime() + Duration.ofMillis(restartWaitTime.getQuantity(TimeUnit.MILLISECONDS)).toNanos();
+    while (true) {
+      try {
+        if (getLogicalServerState(endpoint).isActive()) {
+          output.info("Node: {} is ACTIVE", endpoint);
+          return true;
+        }
+      } catch (RuntimeException e) {
+        LOGGER.debug("Unable to get state of node: {}: {}", endpoint, e.getMessage(), e);
+      }
+      if (System.nanoTime() > deadline) {
+        return false;
+      }
+      try {
+        Thread.sleep(1_000);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException(e);
+      }
+    }
   }
 
   protected final boolean mustBeRestarted(Endpoint endpoint) {
@@ -274,7 +324,18 @@ public abstract class RemoteAction implements Runnable {
    * Nodes are expected to be online.
    */
   protected final void runConfigurationChange(Cluster destinationCluster, Map<Endpoint, LogicalServerState> onlineNodes, DynamicConfigNomadChange change) {
-    if (isReplicaCluster(onlineNodes)) {
+    runConfigurationChange(destinationCluster, destinationCluster, onlineNodes, change);
+  }
+
+  /**
+   * @param currentCluster     the current configuration, used to know if this is a replica cluster (changes are sent through diagnostic)
+   * @param destinationCluster the configuration after the change
+   */
+  // TODO [REPLICA-EXTRA-NODES - to be owned by another developer]: overload added to route the change based on the
+  //  current configuration (see isReplicaCluster), because the destination configuration of a set/unset can have a
+  //  different replica flag (i.e. converting a cluster into a replica cluster, or unsetting replica after a failover).
+  protected final void runConfigurationChange(Cluster currentCluster, Cluster destinationCluster, Map<Endpoint, LogicalServerState> onlineNodes, DynamicConfigNomadChange change) {
+    if (isReplicaCluster(currentCluster)) {
       runConfigurationChangeViaDiagnostic(onlineNodes, change);
     } else {
       LOGGER.trace("runConfigurationChange({}, {})", onlineNodes, change);
@@ -784,8 +845,8 @@ public abstract class RemoteAction implements Runnable {
   }
 
   protected final void ensureClusterIsReadyForChange(Cluster cluster, Map<Endpoint, LogicalServerState> onlineNodes, boolean requireAllNodesAlive) {
-    if (isReplicaCluster(onlineNodes)) {
-      // check if each stripe has either one server either in replica_suspended or passive-replica
+    if (isReplicaCluster(cluster)) {
+      // check if each stripe has its replica node online, and that the other nodes are in diagnostic mode
       ensureReplicasAreAllOnline(cluster, onlineNodes);
     } else {
       // validate that all the online nodes are either actives or passives
@@ -850,16 +911,31 @@ public abstract class RemoteAction implements Runnable {
     }
   }
 
+  // TODO [REPLICA-EXTRA-NODES - to be owned by another developer]: the replica nodes are taken from the configuration.
+  //  A replica node can be in PASSIVE-REPLICA-START, PASSIVE-REPLICA, or ACTIVE (failed over by replica-failover,
+  //  replica flag not unset yet). The other nodes of a replica cluster must be in DIAGNOSTIC state.
+  //  Tests: see isReplicaCluster
   private void ensureReplicasAreAllOnline(Cluster cluster, Map<Endpoint, LogicalServerState> onlineNodes) {
     if (onlineNodes.isEmpty()) {
       throw new IllegalStateException("Expected 1 replica per stripe, but found no online node.");
     }
-    // replicas == list of current replica nodes in the runtime topology
-    List<String> replicas = onlineNodes.entrySet().stream().filter(e -> e.getValue().isReplica() || e.getValue().isReplicaSuspended()).map(Map.Entry::getKey).map(Endpoint::getNodeName).collect(toList());
-    // Check for stripe count. Whether there is a pending dynamic config change or not, the stripe count is not changing.
-    // The stripe count only changes in case of a runtime topology change, which is another case.
-    if (cluster.getStripeCount() != replicas.size()) {
-      throw new IllegalStateException("Expected 1 replica per stripe, but only these nodes are in replica state: " + toString(replicas));
+    Collection<String> replicaNodes = cluster.getNodes().stream().filter(DisasterRecoveryMode::isReplica).map(Node::getName).collect(Collectors.toCollection(TreeSet::new));
+    Collection<String> onlineReplicaNodes = new TreeSet<>();
+    for (Map.Entry<Endpoint, LogicalServerState> entry : onlineNodes.entrySet()) {
+      LogicalServerState state = entry.getValue();
+      if (replicaNodes.contains(entry.getKey().getNodeName())) {
+        if (state.isReplica() || state.isReplicaSuspended() || state.isActive()) {
+          onlineReplicaNodes.add(entry.getKey().getNodeName());
+        }
+      } else if (state != DIAGNOSTIC) {
+        throw new IllegalStateException("Unable to update node: " + entry.getKey() + " that is currently in state: " + state
+            + ". In a replica cluster, the nodes which are not replica must be in DIAGNOSTIC state. If the cluster has just been converted into a replica cluster, please restart the nodes.");
+      }
+    }
+    if (!onlineReplicaNodes.containsAll(replicaNodes)) {
+      Collection<String> missing = new TreeSet<>(replicaNodes);
+      missing.removeAll(onlineReplicaNodes);
+      throw new IllegalStateException("Expected 1 replica per stripe in PASSIVE-REPLICA, PASSIVE-REPLICA-START or ACTIVE state: " + toString(replicaNodes) + ", but nodes: " + toString(missing) + " are not");
     }
   }
 

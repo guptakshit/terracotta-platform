@@ -126,11 +126,29 @@ public class SettingNomadChange extends FilteredNomadChange {
     // then the change won't be applied at runtime and will require a restart
     if (vetoFromThisTargetedNode) {
       LOGGER.trace("canUpdateRuntimeTopology({}, {}, {}): NO (targeted node has vetoed the runtime change and will need to restart)", configuration, getApplicability(), currentNode);
-    } else {
-      LOGGER.trace("canUpdateRuntimeTopology({}, {}, {}): YES", configuration, getApplicability(), currentNode);
+      return false;
     }
 
-    return !vetoFromThisTargetedNode;
+    // check if this node, which is not targeted but in the same stripe as the targeted node, wants to veto the change.
+    // I.e. when a node becomes a replica (or not anymore), the other nodes of the stripe must restart
+    // to start in (or leave) diagnostic mode.
+    boolean vetoFromThisStripePeer = !thisNodeIsTargeted && isStripePeerOfTargetedNode(currentNode)
+        && getApplicability().getNode(currentNode.getCluster())
+        .map(targetedNode -> setting.vetoRuntimeChangeOnStripePeer(currentNode, targetedNode, configuration))
+        .orElse(false);
+    if (vetoFromThisStripePeer) {
+      LOGGER.trace("canUpdateRuntimeTopology({}, {}, {}): NO (stripe peer of targeted node has vetoed the runtime change and will need to restart)", configuration, getApplicability(), currentNode);
+      return false;
+    }
+
+    LOGGER.trace("canUpdateRuntimeTopology({}, {}, {}): YES", configuration, getApplicability(), currentNode);
+    return true;
+  }
+
+  private boolean isStripePeerOfTargetedNode(NodeContext currentNode) {
+    return getSetting().isScope(Scope.NODE)
+        && getApplicability().getLevel() == Scope.NODE
+        && getApplicability().getStripe(currentNode.getCluster()).map(Stripe::getUID).filter(currentNode.getStripeUID()::equals).isPresent();
   }
 
   public String getName() {

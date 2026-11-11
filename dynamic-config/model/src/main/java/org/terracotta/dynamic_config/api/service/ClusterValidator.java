@@ -201,6 +201,14 @@ public class ClusterValidator {
   private void validateDRSetting() {
     List<Stripe> stripes = cluster.getStripes();
 
+    // relay and replica nodes cannot coexist in the same cluster: a cluster is either a relay (source) cluster or a replica (destination) cluster
+    List<String> relayNodes = cluster.getNodes().stream().filter(DisasterRecoveryMode.RELAY::isEnabled).map(Node::getName).sorted().collect(toList());
+    List<String> replicaNodes = cluster.getNodes().stream().filter(DisasterRecoveryMode.REPLICA::isEnabled).map(Node::getName).sorted().collect(toList());
+    if (!relayNodes.isEmpty() && !replicaNodes.isEmpty()) {
+      throw new MalformedClusterException("A cluster cannot have both relay and replica nodes. " +
+        "Relay nodes: " + relayNodes + ". Replica nodes: " + replicaNodes);
+    }
+
     Map<Boolean, List<Stripe>> partitionedStripes = stripes.stream().collect(
       Collectors.partitioningBy(stripe -> stripe.getNodes().stream().anyMatch(DisasterRecoveryMode.REPLICA::isEnabled))
     );
@@ -208,15 +216,14 @@ public class ClusterValidator {
     List<Stripe> stripesWithReplica = partitionedStripes.get(true);
     List<Stripe> stripesMissingReplica = partitionedStripes.get(false);
 
-    // a replica stripe can have at most 1 node total
+    // a replica stripe must have exactly 1 replica node, other nodes of the stripe are allowed
+    // (they will start in diagnostic mode until the replica is failed over)
     for (Stripe stripe : stripesWithReplica) {
-      if (stripe.getNodeCount() > 1) {
-        String nodeDetails = stripe.getNodes().stream()
-          .map(n -> n.getName() + (DisasterRecoveryMode.REPLICA.isEnabled(n) ? " (replica)" : ""))
-          .sorted().collect(Collectors.joining(", "));
-        // Stripe with name: stripe-1 has 3 nodes [node-1 (replica), node-2, node-3]. A replica stripe can have at most 1 node.
-        throw new MalformedClusterException("Stripe with name: " + stripe.getName() + " has " + stripe.getNodeCount() + " nodes [" + nodeDetails + "]. " +
-          "A replica stripe can have at most 1 node.");
+      List<String> stripeReplicas = stripe.getNodes().stream().filter(DisasterRecoveryMode.REPLICA::isEnabled).map(Node::getName).sorted().collect(toList());
+      if (stripeReplicas.size() > 1) {
+        // Stripe with name: stripe-1 has 2 replica nodes: [node-1, node-2]. A stripe can have at most 1 replica node.
+        throw new MalformedClusterException("Stripe with name: " + stripe.getName() + " has " + stripeReplicas.size() + " replica nodes: " + stripeReplicas + ". " +
+          "A stripe can have at most 1 replica node.");
       }
     }
 

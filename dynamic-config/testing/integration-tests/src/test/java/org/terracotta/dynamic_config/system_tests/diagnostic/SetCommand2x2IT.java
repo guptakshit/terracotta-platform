@@ -343,11 +343,71 @@ public class SetCommand2x2IT extends DynamicConfigIT {
   }
 
   @Test
-  public void test_set_replica_multiple_nodes_per_stripe() {
+  public void test_set_replica_multiple_replicas_per_stripe() {
     assertThat(configTool("set", "-s", "localhost:" + getNodePort(), "-c", "stripe.1.node.1.replica=" + "true",
       "-c", "stripe.1.node.1" + ".relay-hostname=" + "localhost1",
       "-c", "stripe.1.node.1" + ".relay-port=" + "9411",
-      "-c", "stripe.1.node.1" + ".relay-group-port=" + "9411"),
-      allOf(is(not(successful())), containsOutput("A replica stripe can have at most 1 node")));
+      "-c", "stripe.1.node.1" + ".relay-group-port=" + "9411",
+      "-c", "stripe.1.node.2.replica=" + "true",
+      "-c", "stripe.1.node.2" + ".relay-hostname=" + "localhost2",
+      "-c", "stripe.1.node.2" + ".relay-port=" + "9412",
+      "-c", "stripe.1.node.2" + ".relay-group-port=" + "9412"),
+      allOf(is(not(successful())), containsOutput("A stripe can have at most 1 replica node")));
+  }
+
+  @Test
+  public void test_set_replica_fails_when_relay_is_disabled_in_same_command() {
+    assertThat(configTool("set", "-s", "localhost:" + getNodePort(),
+      "-c", "stripe.1.node.2.relay=true",
+      "-c", "stripe.1.node.2.replica-hostname=localhost",
+      "-c", "stripe.1.node.2.replica-port=9410",
+      "-c", "stripe.2.node.2.relay=true",
+      "-c", "stripe.2.node.2.replica-hostname=localhost",
+      "-c", "stripe.2.node.2.replica-port=9411"), is(successful()));
+
+    assertThat(configTool("set", "-s", "localhost:" + getNodePort(),
+      "-c", "stripe.1.node.2.relay=false",
+      "-c", "stripe.2.node.2.relay=false",
+      "-c", "stripe.1.node.1.replica=true",
+      "-c", "stripe.1.node.1.relay-hostname=localhost",
+      "-c", "stripe.1.node.1.relay-port=9410",
+      "-c", "stripe.1.node.1.relay-group-port=9430",
+      "-c", "stripe.2.node.1.replica=true",
+      "-c", "stripe.2.node.1.relay-hostname=localhost",
+      "-c", "stripe.2.node.1.relay-port=9411",
+      "-c", "stripe.2.node.1.relay-group-port=9431"),
+      allOf(is(not(successful())),
+        containsOutput("Cannot set replica on nodes: node1, node3 while relay is enabled on nodes: node2, node4. " +
+          "Disable relay on all nodes first, then set replica in a separate command.")));
+  }
+
+  @Test
+  public void test_set_replica_after_relay_is_disabled() {
+    assertThat(configTool("set", "-s", "localhost:" + getNodePort(),
+      "-c", "stripe.1.node.2.relay=true",
+      "-c", "stripe.1.node.2.replica-hostname=localhost",
+      "-c", "stripe.1.node.2.replica-port=9410",
+      "-c", "stripe.2.node.2.relay=true",
+      "-c", "stripe.2.node.2.replica-hostname=localhost",
+      "-c", "stripe.2.node.2.replica-port=9411"), is(successful()));
+
+    // step 1: disable relay on all nodes
+    assertThat(configTool("set", "-s", "localhost:" + getNodePort(),
+      "-c", "stripe.1.node.2.relay=false",
+      "-c", "stripe.2.node.2.relay=false"), is(successful()));
+
+    // step 2: set 1 replica per stripe, the other node of each stripe is kept
+    assertThat(configTool("set", "-s", "localhost:" + getNodePort(),
+      "-c", "stripe.1.node.1.replica=true",
+      "-c", "stripe.1.node.1.relay-hostname=localhost",
+      "-c", "stripe.1.node.1.relay-port=9410",
+      "-c", "stripe.1.node.1.relay-group-port=9430",
+      "-c", "stripe.2.node.1.replica=true",
+      "-c", "stripe.2.node.1.relay-hostname=localhost",
+      "-c", "stripe.2.node.1.relay-port=9411",
+      "-c", "stripe.2.node.1.relay-group-port=9431"), is(successful()));
+
+    assertThat(configTool("get", "-s", "localhost:" + getNodePort(), "-c", "replica", "-t", "index"),
+      allOf(containsOutput("stripe.1.node.1.replica=true"), containsOutput("stripe.2.node.1.replica=true")));
   }
 }

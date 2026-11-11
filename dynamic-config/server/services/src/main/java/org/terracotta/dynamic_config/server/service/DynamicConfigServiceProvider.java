@@ -38,7 +38,6 @@ import org.terracotta.dynamic_config.api.server.SelectingConfigChangeHandler;
 import org.terracotta.dynamic_config.server.service.handler.ClientReconnectWindowConfigChangeHandler;
 import org.terracotta.dynamic_config.server.service.handler.LoggerOverrideConfigChangeHandler;
 import org.terracotta.dynamic_config.server.service.handler.NodeLogDirChangeHandler;
-import org.terracotta.dynamic_config.server.service.handler.ReplicaChangeHandler;
 import org.terracotta.entity.PlatformConfiguration;
 import org.terracotta.entity.ServiceConfiguration;
 import org.terracotta.entity.ServiceProvider;
@@ -108,8 +107,58 @@ public class DynamicConfigServiceProvider implements ServiceProvider {
     addToManager(configChangeHandlerManager, accept(), REPLICA_PORT);
 
     // replica properties
-    ReplicaChangeHandler replicaChangeHandler = new ReplicaChangeHandler(server);
-    addToManager(configChangeHandlerManager, replicaChangeHandler, REPLICA);
+    // TODO [REPLICA-EXTRA-NODES - to be owned by another developer]: ReplicaChangeHandler removed. Unsetting replica
+    //  does not fail over the replica node anymore: replica-failover fails over the replica nodes from the client side
+    //  (JMX call through the diagnostic port) before unsetting the replica flag. See ReplicaFailoverAction.
+    //  Tests: see ReplicaFailoverAction
+    //
+    // OPTIONAL server-side check (not enabled): refuse to unset replica (or set replica=false) on a node which has not
+    // been failed over to ACTIVE yet. The CLI already refuses it (ConfigurationMutationAction#ensureReplicaNodesAreFailedOver),
+    // this would protect against any other client (older CLI, direct Nomad change, ...). It is not enabled for now because
+    // the states in which a replica is allowed to be unset might change in the future (i.e. if PASSIVE-REPLICA-START cannot
+    // transition to ACTIVE anymore and must be unset another way).
+    //
+    // Sample handler (to put in org.terracotta.dynamic_config.server.service.handler.ReplicaChangeHandler):
+    //
+    //   public class ReplicaChangeHandler implements ConfigChangeHandler {
+    //     private final ServerJMX serverJMX;
+    //
+    //     public ReplicaChangeHandler(ServerJMX serverJMX) {
+    //       this.serverJMX = serverJMX;
+    //     }
+    //
+    //     @Override
+    //     public void validate(NodeContext baseConfig, Configuration change) throws InvalidConfigChangeException {
+    //       boolean disabling = !change.getValue().map(Boolean::parseBoolean).orElse(false);
+    //       if (disabling && baseConfig.getNode().getReplica().orDefault()) {
+    //         String state = serverJMX.call("DiagnosticExtensions", "getLogicalServerState", null);
+    //         if (state == null || state.startsWith("Invalid JMX")) {
+    //           throw new InvalidConfigChangeException("Unable to get the state of the server: " + state);
+    //         }
+    //         LogicalServerState logicalServerState = LogicalServerState.valueOf(state);
+    //         if (logicalServerState == LogicalServerState.REPLICA || logicalServerState == LogicalServerState.REPLICA_SUSPENDED) {
+    //           throw new InvalidConfigChangeException("Replica node: " + baseConfig.getNode().getName() + " is in state: " + state
+    //               + ". It must be failed over to ACTIVE with the replica-failover command before unsetting replica.");
+    //         }
+    //       }
+    //     }
+    //   }
+    //
+    // How to integrate:
+    // 1. create the class above (imports: ConfigChangeHandler, InvalidConfigChangeException, Configuration, NodeContext,
+    //    LogicalServerState, ServerJMX). There is no apply(): the default one does nothing, the change is a config change only.
+    // 2. replace the line below with: addToManager(configChangeHandlerManager, new ReplicaChangeHandler(server.getManagement()), REPLICA);
+    // 3. in testing/entity TestServiceProvider, the fallback replica handler (accept()) can stay: the real handler is used when
+    //    it is registered first, there is no ordering guarantee between the service providers.
+    // 4. the handler validate() is only called on the targeted node (see ApplicabilityNomadChangeProcessor), so only the replica
+    //    node checks its own state. The other nodes of the stripe (DIAGNOSTIC) are not concerned.
+    // 5. repair is not impacted: validate() is only called when a change is prepared, a repair only commits or rolls back an
+    //    already prepared change.
+    // 6. tests to add:
+    //    - unit: validate() fails for unset / set false when the server state is REPLICA or REPLICA_SUSPENDED
+    //    - unit: validate() succeeds for unset / set false when ACTIVE, and for set true in any state
+    //    - IT: on a replica cluster, a Nomad change unsetting replica sent directly (bypassing the CLI check) is refused at prepare
+    addToManager(configChangeHandlerManager, accept(), REPLICA);
     addToManager(configChangeHandlerManager, accept(), RELAY_HOSTNAME);
     addToManager(configChangeHandlerManager, accept(), RELAY_PORT);
     addToManager(configChangeHandlerManager, accept(), RELAY_GROUP_PORT);

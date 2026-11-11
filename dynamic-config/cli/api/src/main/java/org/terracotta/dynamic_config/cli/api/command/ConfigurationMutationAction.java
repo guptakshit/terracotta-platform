@@ -29,6 +29,7 @@ import org.terracotta.dynamic_config.api.model.Node;
 import org.terracotta.dynamic_config.api.model.Node.Endpoint;
 import org.terracotta.dynamic_config.api.model.Operation;
 import org.terracotta.dynamic_config.api.model.PropertyHolder;
+import org.terracotta.dynamic_config.api.model.Stripe;
 import org.terracotta.dynamic_config.api.model.UID;
 import org.terracotta.dynamic_config.api.model.nomad.MultiSettingNomadChange;
 import org.terracotta.dynamic_config.api.model.nomad.SettingNomadChange;
@@ -38,6 +39,7 @@ import org.terracotta.inet.HostPort;
 
 import java.time.Duration;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -53,8 +55,13 @@ import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toMap;
 import static org.terracotta.diagnostic.model.LogicalServerState.ACTIVE;
 import static org.terracotta.diagnostic.model.LogicalServerState.ACTIVE_RECONNECTING;
+import static org.terracotta.diagnostic.model.LogicalServerState.DIAGNOSTIC;
 import static org.terracotta.diagnostic.model.LogicalServerState.PASSIVE;
+import static org.terracotta.diagnostic.model.LogicalServerState.PASSIVE_SUSPENDED;
 import static org.terracotta.diagnostic.model.LogicalServerState.RELAY;
+import static org.terracotta.diagnostic.model.LogicalServerState.REPLICA;
+import static org.terracotta.diagnostic.model.LogicalServerState.REPLICA_SUSPENDED;
+import static org.terracotta.diagnostic.model.LogicalServerState.SYNCHRONIZING;
 import static org.terracotta.dynamic_config.api.model.ClusterState.ACTIVATED;
 import static org.terracotta.dynamic_config.api.model.ClusterState.CONFIGURING;
 import static org.terracotta.dynamic_config.api.model.Requirement.CLUSTER_ONLINE;
@@ -120,6 +127,9 @@ public abstract class ConfigurationMutationAction extends ConfigurationAction {
             }
           });
     }
+
+    ensureRelayIsDisabledBeforeSettingReplica(originalCluster, updatedCluster);
+
     if (updatedCluster.equals(originalCluster)) {
       String message = "The requested update will not result in any change to the cluster configuration.";
       output.out(message);
@@ -159,11 +169,19 @@ public abstract class ConfigurationMutationAction extends ConfigurationAction {
       // to sync configuration changes during passive sync
       final Collection<Endpoint> onlineRelayNodes = removeRelayNodes(onlineNodes);
 
+      // nodes becoming replica, or not being replica anymore (failover)
+      final Collection<String> newReplicaNodes = replicaNodesDiff(updatedCluster, originalCluster);
+      final Collection<String> formerReplicaNodes = replicaNodesDiff(originalCluster, updatedCluster);
+      if (!newReplicaNodes.isEmpty() && !formerReplicaNodes.isEmpty()) {
+        throw new IllegalArgumentException("Cannot set replica on nodes: " + toString(newReplicaNodes) + " and unset replica on nodes: " + toString(formerReplicaNodes) + " in the same command");
+      }
+      ensureReplicaNodesAreFailedOver(onlineNodes, formerReplicaNodes);
+
       // cluster is active, we need to run a nomad change and eventually a restart
       MultiSettingNomadChange changes = getNomadChanges(updatedCluster);
       ensureClusterIsReadyForChange(originalCluster, onlineNodes, requiresAllNodesAlive());
       output.info("Applying new configuration change(s) to activated nodes: {}", toString(onlineNodes.keySet()));
-      runConfigurationChange(updatedCluster, onlineNodes, changes);
+      runConfigurationChange(originalCluster, updatedCluster, onlineNodes, changes);
 
       // display unreachable nodes
       final Set<String> unreachableRelayNodes = originalCluster.getNodes()
@@ -186,10 +204,14 @@ public abstract class ConfigurationMutationAction extends ConfigurationAction {
           EnumSet.of(ACTIVE, ACTIVE_RECONNECTING, PASSIVE, RELAY));
       }
       // do we need to restart to apply the changes ?
-      if (changes.getChanges().stream().map(SettingNomadChange::getSetting).anyMatch(setting -> setting.requires(CLUSTER_RESTART))) {
+      if (!newReplicaNodes.isEmpty()) {
+        restartAfterReplicaSet(updatedCluster, onlineNodes);
+      } else if (!formerReplicaNodes.isEmpty()) {
+        restartAfterReplicaUnset(updatedCluster, onlineNodes, formerReplicaNodes);
+      } else if (changes.getChanges().stream().map(SettingNomadChange::getSetting).anyMatch(setting -> setting.requires(CLUSTER_RESTART))) {
         output.out("Restart required for cluster");
         if (autoRestart) {
-          if (isReplicaCluster(onlineNodes)) {
+          if (isReplicaCluster(originalCluster)) {
             restartNodes(onlineNodes.keySet());
           } else {
             rollingRestart(updatedCluster, onlineNodes.keySet().stream().collect(toMap(Endpoint::getNodeName, identity())));
@@ -239,7 +261,7 @@ public abstract class ConfigurationMutationAction extends ConfigurationAction {
               .collect(toList());
           output.out("Restart required for nodes: {} ", toString(addresses));
           if (autoRestart) {
-            if (isReplicaCluster(onlineNodes)) {
+            if (isReplicaCluster(originalCluster)) {
               restartNodes(onlineNodes.keySet().stream()
                 .filter(endpoint -> nodesRequiringRestart.contains(endpoint.getNodeName()))
                 .collect(toList()));
@@ -271,6 +293,157 @@ public abstract class ConfigurationMutationAction extends ConfigurationAction {
     }
 
     output.info("Command successful!");
+  }
+
+  /**
+   * Relay and replica cannot be changed in the same command: relay nodes are not contacted to apply configuration changes,
+   * they only get them by restarting and syncing from the active. Once a stripe has a replica, its other nodes restart
+   * in diagnostic mode, so a relay node that missed the change would never be able to sync it.
+   * Relay must be disabled on all nodes first, then replica can be set in a separate command.
+   */
+  private void ensureRelayIsDisabledBeforeSettingReplica(Cluster originalCluster, Cluster updatedCluster) {
+    List<String> relayNodes = originalCluster.getNodes().stream().filter(DisasterRecoveryMode::isRelay).map(Node::getName).collect(toList());
+    List<String> replicaNodes = updatedCluster.getNodes().stream().filter(DisasterRecoveryMode::isReplica).map(Node::getName).collect(toList());
+    if (!relayNodes.isEmpty() && !replicaNodes.isEmpty()) {
+      throw new IllegalStateException("Cannot set replica on nodes: " + toString(replicaNodes) + " while relay is enabled on nodes: " + toString(relayNodes) + ". " +
+          "Disable relay on all nodes first, then set replica in a separate command.");
+    }
+  }
+
+  /**
+   * @return the names of the nodes which are replica in cluster, but not in other
+   */
+  private static Collection<String> replicaNodesDiff(Cluster cluster, Cluster other) {
+    return cluster.getNodes().stream()
+        .filter(DisasterRecoveryMode::isReplica)
+        .filter(node -> other.getNode(node.getUID()).map(n -> !DisasterRecoveryMode.isReplica(n)).orElse(true))
+        .map(Node::getName)
+        .collect(Collectors.toCollection(TreeSet::new));
+  }
+
+  /**
+   * After setting replica on an activated cluster, the replica nodes must restart to start as replica,
+   * and the other nodes of their stripes must restart to start in diagnostic mode (this is decided at startup only).
+   * The nodes are the ones reporting they must be restarted (see Setting.REPLICA vetoes).
+   * <p>
+   * The restart is always done, even without -auto-restart, because the cluster cannot work correctly until these nodes are restarted.
+   * Nodes are restarted all at once (not a rolling restart): the stripes won't have any active node anymore after the restart.
+   */
+  private void restartAfterReplicaSet(Cluster updatedCluster, Map<Endpoint, LogicalServerState> onlineNodes) {
+    Collection<String> manualRestart = new TreeSet<>();
+    Collection<Endpoint> toRestart = findNodesToRestart(onlineNodes.keySet(), manualRestart);
+    warnOfflineNodes(updatedCluster, onlineNodes);
+    restartForReplicaChange(toRestart, EnumSet.of(REPLICA_SUSPENDED, REPLICA, DIAGNOSTIC), manualRestart);
+  }
+
+  // TODO [REPLICA-EXTRA-NODES - to be owned by another developer]: unsetting replica does not fail over anymore
+  //  (ReplicaChangeHandler was removed): the replica nodes must have been failed over to ACTIVE before, by the
+  //  replica-failover command, which then unsets the replica flag. A plain "unset replica" is only accepted once the
+  //  replica nodes are ACTIVE.
+  //  Tests to add:
+  //  - unit: unset replica on an activated replica cluster with the replica node in PASSIVE-REPLICA state fails with this message
+  //  - unit: unset replica on an activated replica cluster with the replica node ACTIVE succeeds
+  private void ensureReplicaNodesAreFailedOver(Map<Endpoint, LogicalServerState> onlineNodes, Collection<String> formerReplicaNodes) {
+    Collection<String> notActive = new TreeSet<>(formerReplicaNodes);
+    onlineNodes.forEach((endpoint, state) -> {
+      if (state.isActive()) {
+        notActive.remove(endpoint.getNodeName());
+      }
+    });
+    if (!notActive.isEmpty()) {
+      throw new IllegalStateException("Cannot unset replica on nodes: " + toString(notActive) + " because they are not ACTIVE. " +
+          "Please use the replica-failover command to fail over the replica nodes.");
+    }
+  }
+
+  /**
+   * After unsetting replica on an activated replica cluster, the former replica nodes are already active
+   * (they were failed over by the replica-failover command), and the other nodes of their stripes, which are in
+   * diagnostic mode, must restart to join the new active as passives.
+   * <p>
+   * The former replica nodes are never restarted: they are the only active nodes of their stripe.
+   * The other nodes of a stripe are only restarted once the former replica of the stripe is active: restarting them
+   * without an active node in the stripe would make one of them become active with no data.
+   * <p>
+   * The restart is always done, even without -auto-restart, because the cluster cannot work correctly until these nodes are restarted.
+   */
+  private void restartAfterReplicaUnset(Cluster updatedCluster, Map<Endpoint, LogicalServerState> onlineNodes, Collection<String> formerReplicaNodes) {
+    Collection<String> manualRestart = new TreeSet<>();
+    Collection<Endpoint> toRestart = new TreeSet<>(Comparator.comparing(Endpoint::toString));
+
+    for (Endpoint formerReplica : onlineNodes.keySet()) {
+      if (!formerReplicaNodes.contains(formerReplica.getNodeName())) {
+        continue;
+      }
+      Stripe stripe = updatedCluster.getStripeByNode(formerReplica.getNodeUID()).orElseThrow(AssertionError::new);
+      List<Endpoint> peers = onlineNodes.keySet().stream()
+          .filter(endpoint -> !endpoint.equals(formerReplica) && stripe.containsNode(endpoint.getNodeUID()))
+          .collect(toList());
+      Collection<Endpoint> peersToRestart = findNodesToRestart(peers, manualRestart);
+
+      if (waitForActive(formerReplica)) {
+        toRestart.addAll(peersToRestart);
+      } else {
+        peersToRestart.stream().map(Endpoint::getNodeName).forEach(manualRestart::add);
+        output.warn("IMPORTANT: Node: {} did not become ACTIVE. Nodes: {} in stripe: {} were not restarted. " +
+            "They must only be restarted once a node of the stripe is ACTIVE, otherwise one of them could become ACTIVE without data.", formerReplica, toString(peersToRestart), stripe.getName());
+      }
+
+      if (mustBeRestarted(formerReplica)) {
+        // i.e. other settings requiring a restart were changed in the same command
+        output.warn("IMPORTANT: Node: {} is now ACTIVE and has pending changes requiring a restart. " +
+            "It was not restarted. Please restart it manually once the other nodes of stripe: {} are PASSIVE.", formerReplica, stripe.getName());
+      }
+    }
+
+    warnOfflineNodes(updatedCluster, onlineNodes);
+    restartForReplicaChange(toRestart, EnumSet.of(ACTIVE, ACTIVE_RECONNECTING, PASSIVE, PASSIVE_SUSPENDED, SYNCHRONIZING), manualRestart);
+  }
+
+  /**
+   * @return the endpoints that must be restarted. Endpoints which cannot be asked are added to manualRestart.
+   */
+  private Collection<Endpoint> findNodesToRestart(Collection<Endpoint> endpoints, Collection<String> manualRestart) {
+    Collection<Endpoint> toRestart = new TreeSet<>(Comparator.comparing(Endpoint::toString));
+    for (Endpoint endpoint : endpoints) {
+      try {
+        if (mustBeRestarted(endpoint)) {
+          toRestart.add(endpoint);
+        }
+      } catch (RuntimeException e) {
+        LOGGER.warn("Node: {} is not reachable anymore: {}", endpoint, e.getMessage(), e);
+        manualRestart.add(endpoint.getNodeName());
+      }
+    }
+    return toRestart;
+  }
+
+  private void restartForReplicaChange(Collection<Endpoint> toRestart, Collection<LogicalServerState> acceptedStates, Collection<String> manualRestart) {
+    if (!toRestart.isEmpty()) {
+      output.info("Restarting nodes: {} to apply the replica change", toString(toRestart));
+      try {
+        restartNodes(toRestart, acceptedStates);
+      } catch (RuntimeException e) {
+        LOGGER.warn("Failed to restart nodes: {}: {}", toString(toRestart), e.getMessage(), e);
+        toRestart.stream().map(Endpoint::getNodeName).forEach(manualRestart::add);
+      }
+    }
+    if (!manualRestart.isEmpty()) {
+      output.warn("IMPORTANT: The replica change has been applied, but nodes: {} may not have been restarted. " +
+          "Please verify their state and restart them manually to apply the change.", toString(manualRestart));
+    }
+  }
+
+  /**
+   * Offline nodes did not receive the change and will start with their previous configuration.
+   */
+  private void warnOfflineNodes(Cluster updatedCluster, Map<Endpoint, LogicalServerState> onlineNodes) {
+    Collection<String> offline = updatedCluster.getNodes().stream().map(Node::getName).collect(Collectors.toCollection(TreeSet::new));
+    onlineNodes.keySet().stream().map(Endpoint::getNodeName).forEach(offline::remove);
+    if (!offline.isEmpty()) {
+      output.warn("IMPORTANT: Nodes: {} were offline and did not receive the replica change. " +
+          "They will start with their previous configuration. Please detach them from the cluster.", toString(offline));
+    }
   }
 
   private MultiSettingNomadChange getNomadChanges(Cluster cluster) {

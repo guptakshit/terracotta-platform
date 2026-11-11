@@ -913,7 +913,7 @@ public class ConfigurationTest {
       }));
     });
 
-    // replica: GET at any level, SET/IMPORT at NODE level (CONFIGURING only), UNSET at NODE level (CONFIGURING, ACTIVATED)
+    // replica: GET at any level, SET/UNSET at NODE level (CONFIGURING, ACTIVATED), IMPORT at NODE level (CONFIGURING only)
     Stream.of("replica").forEach(setting -> {
       Stream.of(CONFIGURING, ACTIVATED).forEach(state -> state.filter(GET).forEach(op -> NS.forEach(ns -> allow(state, op, ns + setting))));
 
@@ -923,17 +923,11 @@ public class ConfigurationTest {
         allow(state, op, "stripe.1.node.1." + setting);
       }));
 
-      Stream.of(CONFIGURING).forEach(state -> state.filter(SET).forEach(op -> {
+      Stream.of(CONFIGURING, ACTIVATED).forEach(state -> state.filter(SET).forEach(op -> {
         reject(state, op, setting + "=true");
         reject(state, op, "stripe.1." + setting + "=true");
         allow(state, op, "stripe.1.node.1." + setting + "=true");
         reject(state, op, "stripe.1.node.1." + setting + "=");
-      }));
-
-      Stream.of(ACTIVATED).forEach(state -> state.filter(SET).forEach(op -> {
-        reject(state, op, setting + "=true");
-        reject(state, op, "stripe.1." + setting + "=true");
-        reject(state, op, "stripe.1.node.1." + setting + "=true");
       }));
 
       Stream.of(CONFIGURING).forEach(state -> state.filter(IMPORT).forEach(op -> {

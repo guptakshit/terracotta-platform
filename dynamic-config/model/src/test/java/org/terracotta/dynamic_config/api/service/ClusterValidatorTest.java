@@ -555,7 +555,7 @@ public class ClusterValidatorTest {
   }
 
   @Test
-  public void testBadDR_replicaClusterWithMultipleNodesPerStripe() {
+  public void testBadDR_replicaClusterWithMultipleReplicasPerStripe() {
     // Multiple replica nodes in same stripe
     Node node1 = newTestNode("node1", "localhost1")
       .setReplica(true)
@@ -569,28 +569,76 @@ public class ClusterValidatorTest {
       .setRelayGroupPort(9431);
     Cluster cluster = newTestCluster("cluster1", newTestStripe("stripe1").addNodes(node1, node2));
     assertClusterValidationFailsContainsMessage(
-      "Stripe with name: stripe1 has 2 nodes [node1 (replica), node2 (replica)]. A replica stripe can have at most 1 node.",
+      "Stripe with name: stripe1 has 2 replica nodes: [node1, node2]. A stripe can have at most 1 replica node.",
       cluster);
 
-    // Multiple replica nodes in second stripe (while first stripe has 1)
+    // Multiple replica nodes in second stripe (while first stripe has 1), alongside a normal node
     Node node3 = newTestNode("node3", "localhost3", Testing.N_UIDS[3])
       .setReplica(true)
       .setRelayHostname("relay-host3")
       .setRelayPort(9412)
       .setRelayGroupPort(9432);
+    Node node4 = newTestNode("node4", "localhost4", Testing.N_UIDS[4]);
     Cluster cluster2 = newTestCluster("cluster2",
       newTestStripe("stripe1").addNodes(node1),
-      newTestStripe("stripe2", Testing.S_UIDS[2]).addNodes(node2, node3));
+      newTestStripe("stripe2", Testing.S_UIDS[2]).addNodes(node2, node3, node4));
     assertClusterValidationFailsContainsMessage(
-      "Stripe with name: stripe2 has 2 nodes [node2 (replica), node3 (replica)]. A replica stripe can have at most 1 node.",
+      "Stripe with name: stripe2 has 2 replica nodes: [node2, node3]. A stripe can have at most 1 replica node.",
       cluster2);
+  }
 
-    // Replica node alongside a normal node in same stripe
-    Node node4 = newTestNode("node4", "localhost4", Testing.N_UIDS[2]);
-    Cluster cluster3 = newTestCluster("cluster3", newTestStripe("stripe1").addNodes(node1, node4));
+  @Test
+  public void testGoodDR_replicaClusterWithExtraNodesPerStripe() {
+    // Replica node alongside normal nodes in same stripe
+    Node node1 = newTestNode("node1", "localhost1", Testing.N_UIDS[1])
+      .setReplica(true)
+      .setRelayHostname("relay-host")
+      .setRelayPort(9410)
+      .setRelayGroupPort(9430);
+    Node node2 = newTestNode("node2", "localhost2", Testing.N_UIDS[2]);
+    Node node3 = newTestNode("node3", "localhost3", Testing.N_UIDS[3]);
+    new ClusterValidator(newTestCluster("cluster1", newTestStripe("stripe1").addNodes(node1, node2, node3))).validate(ClusterState.ACTIVATED);
+
+    // Multiple stripes: 1 replica per stripe, with a different number of extra nodes per stripe
+    Node node4 = newTestNode("node4", "localhost4", Testing.N_UIDS[4])
+      .setReplica(true)
+      .setRelayHostname("relay-host2")
+      .setRelayPort(9411)
+      .setRelayGroupPort(9431);
+    Cluster cluster2 = newTestCluster("cluster2",
+      newTestStripe("stripe1").addNodes(node1, node2, node3),
+      newTestStripe("stripe2", Testing.S_UIDS[2]).addNodes(node4));
+    new ClusterValidator(cluster2).validate(ClusterState.ACTIVATED);
+  }
+
+  @Test
+  public void testBadDR_relayAndReplicaInSameCluster() {
+    Node replica = newTestNode("node1", "localhost1", Testing.N_UIDS[1])
+      .setReplica(true)
+      .setRelayHostname("relay-host")
+      .setRelayPort(9410)
+      .setRelayGroupPort(9430);
+    Node relay = newTestNode("node2", "localhost2", Testing.N_UIDS[2])
+      .setRelay(true)
+      .setReplicaHostname("replica-host")
+      .setReplicaPort(9410);
+
+    // relay and replica in the same stripe
     assertClusterValidationFailsContainsMessage(
-      "Stripe with name: stripe1 has 2 nodes [node1 (replica), node4]. A replica stripe can have at most 1 node.",
-      cluster3);
+      "A cluster cannot have both relay and replica nodes. Relay nodes: [node2]. Replica nodes: [node1]",
+      newTestCluster("cluster1", newTestStripe("stripe1").addNodes(replica, relay)));
+
+    // relay and replica in different stripes
+    Node replica2 = newTestNode("node3", "localhost3", Testing.N_UIDS[3])
+      .setReplica(true)
+      .setRelayHostname("relay-host2")
+      .setRelayPort(9411)
+      .setRelayGroupPort(9431);
+    assertClusterValidationFailsContainsMessage(
+      "A cluster cannot have both relay and replica nodes. Relay nodes: [node2]. Replica nodes: [node1, node3]",
+      newTestCluster("cluster1",
+        newTestStripe("stripe1").addNodes(replica),
+        newTestStripe("stripe2", Testing.S_UIDS[2]).addNodes(replica2, relay)));
   }
 
   @Test

@@ -428,12 +428,53 @@ public enum Setting {
     intoNode((node, value) -> node.setReplica(value == null ? null : Boolean.valueOf(value))),
     asList(
       when(CONFIGURING, ACTIVATED).allow(GET).atAnyLevels(),
-      when(CONFIGURING).allow(SET, IMPORT).atLevel(NODE),
-      when(CONFIGURING, ACTIVATED).allow(UNSET).atLevel(NODE)  // Activated clusters can only unset, not set to become replica
+      when(CONFIGURING).allow(IMPORT).atLevel(NODE),
+      // Activated clusters can be converted into a replica cluster (set) and failed over (unset)
+      when(CONFIGURING, ACTIVATED).allow(SET, UNSET).atLevel(NODE)
     ),
     of(PRESENCE),
     asList("true", "false")
-  ),
+  ) {
+    /**
+     * Enabling replica on the targeted node is only applied at startup (the node starts as a replica),
+     * so the targeted node must be restarted.
+     * Disabling replica is applied at runtime: the replica node has already been failed over to active by the
+     * replica-failover command, which then unsets the replica flag.
+     * <p>
+     * The decision only depends on the requested value and the replica flag of the targeted node, which is
+     * only changed by this setting, so it is the same for every call of canUpdateRuntimeTopology during a change.
+     */
+    @Override
+    public boolean vetoRuntimeChange(NodeContext currentNode, Configuration configuration) {
+      final boolean vetoed;
+      if (this == configuration.getSetting()) {
+        boolean requested = configuration.getValue().map(Boolean::parseBoolean).orElse(false);
+        vetoed = requested && !currentNode.getNode().getReplica().orDefault();
+      } else {
+        vetoed = super.vetoRuntimeChange(currentNode, configuration);
+      }
+      LoggerFactory.getLogger(Setting.class).trace("vetoRuntimeChange({}, {}): {}", configuration, currentNode.getNode(), vetoed);
+      return vetoed;
+    }
+
+    /**
+     * When a stripe has a replica node, the other nodes of the stripe start in diagnostic mode, and this is
+     * only decided at startup. So the other nodes of the stripe must be restarted whenever the replica flag
+     * of the targeted node changes: to go to diagnostic mode (set), or to leave it and join the new active (unset).
+     */
+    @Override
+    public boolean vetoRuntimeChangeOnStripePeer(NodeContext peerNode, Node targetedNode, Configuration configuration) {
+      final boolean vetoed;
+      if (this == configuration.getSetting()) {
+        boolean requested = configuration.getValue().map(Boolean::parseBoolean).orElse(false);
+        vetoed = requested != targetedNode.getReplica().orDefault();
+      } else {
+        vetoed = super.vetoRuntimeChangeOnStripePeer(peerNode, targetedNode, configuration);
+      }
+      LoggerFactory.getLogger(Setting.class).trace("vetoRuntimeChangeOnStripePeer({}, {}, {}): {}", configuration, peerNode.getNode(), targetedNode, vetoed);
+      return vetoed;
+    }
+  },
   RELAY_HOSTNAME(SettingName.RELAY_HOSTNAME,
     of(V1, V2),
     false,
@@ -1221,6 +1262,20 @@ public enum Setting {
   }
 
   public boolean vetoRuntimeChange(NodeContext currentNode, Configuration configuration) {
+    return false;
+  }
+
+  /**
+   * Same as {@link #vetoRuntimeChange(NodeContext, Configuration)}, but called for a node-level setting on the nodes
+   * that are NOT targeted by the change, but which are in the same stripe as the targeted node.
+   * If it returns true, the change won't be applied to the runtime topology of this peer node, which will need to restart.
+   * <p>
+   * This is required when a node-level setting changes how the other nodes of the stripe start.
+   *
+   * @param peerNode     the context of the current node, which is not targeted by the change
+   * @param targetedNode the node targeted by the change, as seen in the runtime topology of the peer node
+   */
+  public boolean vetoRuntimeChangeOnStripePeer(NodeContext peerNode, Node targetedNode, Configuration configuration) {
     return false;
   }
 
