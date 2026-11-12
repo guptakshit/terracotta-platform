@@ -29,7 +29,7 @@ import org.terracotta.dynamic_config.api.model.Version;
 
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
+import java.util.Collection;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -199,90 +199,82 @@ public class ClusterValidator {
   }
 
   private void validateDRSetting() {
-    List<Stripe> stripes = cluster.getStripes();
+    // per node first: a node cannot be both relay and replica, and each mode's properties must be set together
+    cluster.getNodes().forEach(this::validateDRProperties);
 
-    // relay and replica nodes cannot coexist in the same cluster: a cluster is either a relay (source) cluster or a replica (destination) cluster
-    List<String> relayNodes = cluster.getNodes().stream().filter(DisasterRecoveryMode.RELAY::isEnabled).map(Node::getName).sorted().collect(toList());
-    List<String> replicaNodes = cluster.getNodes().stream().filter(DisasterRecoveryMode.REPLICA::isEnabled).map(Node::getName).sorted().collect(toList());
-    if (!relayNodes.isEmpty() && !replicaNodes.isEmpty()) {
+    List<String> replicaNodes = enabledNodeNames(cluster.getNodes(), DisasterRecoveryMode.REPLICA);
+    if (replicaNodes.isEmpty()) {
+      return;
+    }
+
+    // a cluster is either a relay (source) cluster or a replica (destination) cluster
+    List<String> relayNodes = enabledNodeNames(cluster.getNodes(), DisasterRecoveryMode.RELAY);
+    if (!relayNodes.isEmpty()) {
       throw new MalformedClusterException("A cluster cannot have both relay and replica nodes. " +
         "Relay nodes: " + relayNodes + ". Replica nodes: " + replicaNodes);
     }
 
-    Map<Boolean, List<Stripe>> partitionedStripes = stripes.stream().collect(
-      Collectors.partitioningBy(stripe -> stripe.getNodes().stream().anyMatch(DisasterRecoveryMode.REPLICA::isEnabled))
-    );
-
-    List<Stripe> stripesWithReplica = partitionedStripes.get(true);
-    List<Stripe> stripesMissingReplica = partitionedStripes.get(false);
-
-    // a replica stripe must have exactly 1 replica node, other nodes of the stripe are allowed
-    // (they will start in diagnostic mode until the replica is failed over)
-    for (Stripe stripe : stripesWithReplica) {
-      List<String> stripeReplicas = stripe.getNodes().stream().filter(DisasterRecoveryMode.REPLICA::isEnabled).map(Node::getName).sorted().collect(toList());
+    // each stripe must have exactly 1 replica node; other nodes of the stripe are allowed
+    // (they start in diagnostic mode until the replica is failed over)
+    List<String> stripesWithReplica = new ArrayList<>();
+    List<String> stripesMissingReplica = new ArrayList<>();
+    for (Stripe stripe : cluster.getStripes()) {
+      List<String> stripeReplicas = enabledNodeNames(stripe.getNodes(), DisasterRecoveryMode.REPLICA);
       if (stripeReplicas.size() > 1) {
         // Stripe with name: stripe-1 has 2 replica nodes: [node-1, node-2]. A stripe can have at most 1 replica node.
         throw new MalformedClusterException("Stripe with name: " + stripe.getName() + " has " + stripeReplicas.size() + " replica nodes: " + stripeReplicas + ". " +
           "A stripe can have at most 1 replica node.");
       }
+      if (stripeReplicas.isEmpty()) {
+        stripesMissingReplica.add(stripe.getName());
+      } else {
+        stripesWithReplica.add(stripe.getName());
+      }
     }
-
-    // all-or-nothing across stripes, if one stripe has a replica then all should have
-    if (!stripesWithReplica.isEmpty() && !stripesMissingReplica.isEmpty()) {
+    if (!stripesMissingReplica.isEmpty()) {
       throw new MalformedClusterException("If any stripe has a replica node, all stripes must have exactly 1 replica node. " +
-        "Stripes with a replica: [" + joinSortedNames(stripesWithReplica) + "]. " +
-        "Stripes missing a replica: [" + joinSortedNames(stripesMissingReplica) + "]");
+        "Stripes with a replica: [" + sortedJoin(stripesWithReplica) + "]. " +
+        "Stripes missing a replica: [" + sortedJoin(stripesMissingReplica) + "]");
     }
-
-    // Validate each node's disaster recovery settings
-    // - No node can have both relay and replica enabled
-    // - when no relay or replica is configured, all-or-nothing validation for required properties
-    // - When node.replica=true, node must have replica properties configured
-    // - When node.relay=true, node must have relay properties configured
-    cluster.getNodes().forEach(this::checkAndGetDRMode);
   }
 
-  private static String joinSortedNames(List<Stripe> stripes) {
-    return stripes.stream().map(Stripe::getName).sorted().collect(Collectors.joining(", "));
+  private static List<String> enabledNodeNames(Collection<Node> nodes, DisasterRecoveryMode mode) {
+    return nodes.stream().filter(mode::isEnabled).map(Node::getName).sorted().collect(toList());
   }
 
-  private DisasterRecoveryMode checkAndGetDRMode(Node node) {
-    boolean relayMode = DisasterRecoveryMode.RELAY.isEnabled(node);
-    boolean replicaMode = DisasterRecoveryMode.REPLICA.isEnabled(node);
-    if (relayMode && replicaMode) {
+  private static String sortedJoin(List<String> names) {
+    return names.stream().sorted().collect(Collectors.joining(", "));
+  }
+
+  private void validateDRProperties(Node node) {
+    if (DisasterRecoveryMode.RELAY.isEnabled(node) && DisasterRecoveryMode.REPLICA.isEnabled(node)) {
       throw new MalformedClusterException("Node with name: " + node.getName() + " has both relay and replica settings enabled");
     }
     validateRequiredDRProperties(node, DisasterRecoveryMode.RELAY);
     validateRequiredDRProperties(node, DisasterRecoveryMode.REPLICA);
-    return DisasterRecoveryMode.from(node);
   }
 
+  /**
+   * When the mode is enabled, all its required properties must be set.
+   * When the mode is disabled, its required properties must be either all set or all unset.
+   */
   private void validateRequiredDRProperties(Node node, DisasterRecoveryMode mode) {
-    if (mode == DisasterRecoveryMode.NONE) {
+    Map<String, OptionalConfig<?>> requiredProps = mode.getRequiredProperties(node);
+    long configuredCount = requiredProps.values().stream().filter(OptionalConfig::isConfigured).count();
+    boolean enabled = mode.isEnabled(node);
+    boolean allSet = configuredCount == requiredProps.size();
+    boolean noneSet = configuredCount == 0;
+    if (allSet || (!enabled && noneSet)) {
       return;
     }
-
-    Map<String, OptionalConfig<?>> requiredProps = mode.getRequiredProperties(node);
-    long configuredCount = requiredProps.values().stream()
-      .filter(OptionalConfig::isConfigured)
-      .count();
-
-    if (mode.isEnabled(node)) {
-      if (configuredCount != requiredProps.size()) {
-        Map<String, Object> inconsistent = new LinkedHashMap<>();
-        requiredProps.forEach((key, value) -> inconsistent.put(key, String.valueOf(value.orDefault())));
-        throw new MalformedClusterException("The " + mode.getLabel() + " setting is enabled for node with name: " + node.getName() +
-          ", " + mode.getLabel() + " properties: " + inconsistent + " aren't well-formed, " + requiredProps.keySet() + " need to be set together");
-      }
-    } else {
-      // when mode is disabled and the user sets partial configuration for a node
-      if (configuredCount > 0 && configuredCount < requiredProps.size()) {
-        Map<String, Object> inconsistent = new LinkedHashMap<>();
-        requiredProps.forEach((key, value) -> inconsistent.put(key, String.valueOf(value.orDefault())));
-        throw new MalformedClusterException("The " + mode.getLabel() + " setting is disabled for node with name: " + node.getName() +
-          ", properties: " + inconsistent + " are partially configured. Either remove all properties or set all required properties.");
-      }
+    Map<String, String> values = new LinkedHashMap<>();
+    requiredProps.forEach((key, value) -> values.put(key, String.valueOf(value.orDefault())));
+    if (enabled) {
+      throw new MalformedClusterException("The " + mode.getLabel() + " setting is enabled for node with name: " + node.getName() +
+        ", " + mode.getLabel() + " properties: " + values + " aren't well-formed, " + requiredProps.keySet() + " need to be set together");
     }
+    throw new MalformedClusterException("The " + mode.getLabel() + " setting is disabled for node with name: " + node.getName() +
+      ", properties: " + values + " are partially configured. Either remove all properties or set all required properties.");
   }
 
   private void checkPublicAddressContent() {
