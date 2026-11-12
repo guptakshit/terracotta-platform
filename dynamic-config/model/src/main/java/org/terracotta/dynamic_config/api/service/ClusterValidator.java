@@ -199,16 +199,18 @@ public class ClusterValidator {
   }
 
   private void validateDRSetting() {
-    // per node first: a node cannot be both relay and replica, and each mode's properties must be set together
-    cluster.getNodes().forEach(this::validateDRProperties);
+    Collection<Node> nodes = cluster.getNodes();
 
-    List<String> replicaNodes = enabledNodeNames(cluster.getNodes(), DisasterRecoveryMode.REPLICA);
+    // per node first: a node cannot be both relay and replica, and each mode's properties must be set together
+    nodes.forEach(this::validateDRProperties);
+
+    List<String> replicaNodes = enabledNodeNames(nodes, DisasterRecoveryMode.REPLICA);
     if (replicaNodes.isEmpty()) {
       return;
     }
 
     // a cluster is either a relay (source) cluster or a replica (destination) cluster
-    List<String> relayNodes = enabledNodeNames(cluster.getNodes(), DisasterRecoveryMode.RELAY);
+    List<String> relayNodes = enabledNodeNames(nodes, DisasterRecoveryMode.RELAY);
     if (!relayNodes.isEmpty()) {
       throw new MalformedClusterException("A cluster cannot have both relay and replica nodes. " +
         "Relay nodes: " + relayNodes + ". Replica nodes: " + replicaNodes);
